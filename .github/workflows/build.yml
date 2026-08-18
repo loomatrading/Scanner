@@ -27,7 +27,7 @@ jobs:
         pyinstaller --noconfirm --onefile --windowed app.py
 
     - name: Upload EXE artifact
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: CamScanner-Desktop
         path: dist/*.exe
