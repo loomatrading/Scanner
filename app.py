@@ -1,43 +1,63 @@
 import sys
+import os
 import cv2
 import numpy as np
-import os
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QHBoxLayout, 
                              QVBoxLayout, QPushButton, QLabel, QListWidget, 
                              QListWidgetItem, QCheckBox, QFileDialog, QFrame, 
-                             QSplitter, QSizePolicy)
-from PyQt5.QtGui import QImage, QPixmap, QFont
-from PyQt5.QtCore import Qt
+                             QGridLayout, QGraphicsDropShadowEffect)
+from PyQt5.QtGui import QImage, QPixmap, QColor
+from PyQt5.QtCore import Qt, QSize
 
 # ==========================================
-# 1. محرك معالجة الصور الاحترافي
+# 1. خوارزميات المعالجة (CamScanner Magic Engine)
 # ==========================================
 
-class ImageProcessorPro:
+class CamScannerEngine:
     @staticmethod
-    def advanced_shadow_removal(image):
-        """خوارزمية لإزالة الظلال والكرمشة بالكامل وتنظيف الخلفية"""
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    def magic_pro_enhance(img):
+        """
+        خوارزمية CamScanner Magic Color الحقيقية:
+        - إزالة الظلال والتجاعيد مع الحفاظ على ألوان الأختام والشعارات
+        - تبييض الورقة لتصبح ناصعة البيض بدون نويز أو خربشة
+        """
+        if img is None:
+            return None
+
+        # التحويل لنظام ألوان LAB لعزل الإضاءة عن الألوان
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
         l_channel, a_channel, b_channel = cv2.split(lab)
 
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        cl = clahe.apply(l_channel)
+        # حساب خلفية الورقة والظلال لإزالتها
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (35, 35))
+        background = cv2.morphologyEx(l_channel, cv2.MORPH_CLOSE, kernel)
 
-        enhanced_lab = cv2.merge((cl, a_channel, b_channel))
-        cleaned_color = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        # قسمة الصورة على الخلفية لتوحيد بياض الورقة
+        norm_l = cv2.divide(l_channel, background, scale=255)
 
-        gray = cv2.cvtColor(cleaned_color, cv2.COLOR_BGR2GRAY)
-        final = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY, 11, 2)
-        
-        return cv2.cvtColor(final, cv2.COLOR_GRAY2BGR)
+        # ضبط التباين لإبراز النصوص وتصفية الورقة
+        norm_l = cv2.normalize(norm_l, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+        enhanced_l = cv2.convertScaleAbs(norm_l, alpha=1.6, beta=-40)
+
+        # دمج ألوان الأختام والشعارات الأصلية
+        enhanced_lab = cv2.merge((enhanced_l, a_channel, b_channel))
+        result = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+
+        # زيادة حدة النصوص (Sharpening)
+        gaussian = cv2.GaussianBlur(result, (0, 0), 3)
+        sharpened = cv2.addWeighted(result, 1.5, gaussian, -0.5, 0)
+
+        return sharpened
 
     @staticmethod
     def auto_detect_and_crop(image):
-        """كشف زوايا المستند تلقائياً وتعديل المنظور"""
+        if image is None:
+            return None
+            
+        orig = image.copy()
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        edged = cv2.Canny(blur, 50, 150, apertureSize=3)
+        edged = cv2.Canny(blur, 30, 120)
 
         cnts, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cnts = sorted(cnts, key=cv2.contourArea, reverse=True)[:5]
@@ -46,13 +66,13 @@ class ImageProcessorPro:
         for c in cnts:
             peri = cv2.arcLength(c, True)
             approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-            if len(approx) == 4:
+            if len(approx) == 4 and cv2.contourArea(c) > (image.shape[0] * image.shape[1] * 0.15):
                 doc_cnt = approx
                 break
 
         if doc_cnt is not None:
-            return ImageProcessorPro.four_point_transform(image, doc_cnt.reshape(4, 2))
-        return image
+            return CamScannerEngine.four_point_transform(orig, doc_cnt.reshape(4, 2))
+        return orig
 
     @staticmethod
     def order_points(pts):
@@ -67,7 +87,7 @@ class ImageProcessorPro:
 
     @staticmethod
     def four_point_transform(image, pts):
-        rect = ImageProcessorPro.order_points(pts)
+        rect = CamScannerEngine.order_points(pts)
         (tl, tr, br, bl) = rect
 
         widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
@@ -85,207 +105,264 @@ class ImageProcessorPro:
             [0, maxHeight - 1]], dtype="float32")
 
         M = cv2.getPerspectiveTransform(rect, dst)
-        warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
-        return warped
+        return cv2.warpPerspective(image, M, (maxWidth, maxHeight))
 
     @staticmethod
     def rotate_image(image, angle):
-        """تدوير الصورة بزاوية محددة"""
-        (h, w) = image.shape[:2]
-        (cX, cY) = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D((cX, cY), angle, 1.0)
-        cos = np.abs(M[0, 0])
-        sin = np.abs(M[0, 1])
-        nW = int((h * sin) + (w * cos))
-        nH = int((h * cos) + (w * sin))
-        M[0, 2] += (nW / 2) - cX
-        M[1, 2] += (nH / 2) - cY
-        return cv2.warpAffine(image, M, (nW, nH))
+        if angle == 90:
+            return cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        elif angle == -90:
+            return cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif angle == 180:
+            return cv2.rotate(image, cv2.ROTATE_180)
+        return image
 
     @staticmethod
     def apply_enhance(image):
-        return cv2.convertScaleAbs(image, alpha=1.3, beta=20)
+        return cv2.convertScaleAbs(image, alpha=1.2, beta=10)
 
     @staticmethod
     def apply_lighten(image):
-        return cv2.convertScaleAbs(image, alpha=1.1, beta=50)
+        return cv2.convertScaleAbs(image, alpha=1.1, beta=40)
 
     @staticmethod
     def apply_bw(image):
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        return cv2.cvtColor(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1], cv2.COLOR_GRAY2BGR)
+        _, thresh = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
 
 # ==========================================
-# 2. تصميم الواجهة الاحترافية (Pro UI)
+# 2. الواجهة الرسومية المطابقة (CamScanner UI)
 # ==========================================
 
-class CamScannerPro(QMainWindow):
+class CamScannerUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("CamScanner PC Studio Pro")
-        self.setGeometry(100, 100, 1200, 750)
-        self.original_image = None
-        self.processed_image = None
-        self.filter_applied = "magic"
+        self.resize(1280, 800)
+        
+        self.images_list = []
+        self.current_idx = -1
 
         self.init_ui()
 
     def init_ui(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #F8F9FB; }
-            QWidget { font-family: 'Segoe UI', Arial; font-size: 13px; }
-            QPushButton { border-radius: 6px; font-weight: bold; }
+            QMainWindow { background-color: #F0F2F5; }
+            QWidget { font-family: 'Segoe UI', Arial, sans-serif; }
         """)
 
         central_widget = QWidget()
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(15, 10, 15, 15)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-        # Top Bar
-        top_bar = QHBoxLayout()
-        top_bar.addStretch()
-        self.btn_import = QPushButton("  Import Images")
+        # 1. Top Bar
+        top_bar = QWidget()
+        top_bar.setFixedHeight(65)
+        top_bar.setStyleSheet("background-color: #F0F2F5;")
+        top_layout = QHBoxLayout(top_bar)
+
+        self.btn_import = QPushButton("   Import Images")
+        self.btn_import.setFixedHeight(42)
+        self.btn_import.setCursor(Qt.PointingHandCursor)
         self.btn_import.setStyleSheet("""
             QPushButton {
                 background-color: #FFFFFF;
                 border: 1px solid #DCDFE6;
-                padding: 10px 25px;
-                font-size: 14px;
-                color: #303133;
+                border-radius: 8px;
+                padding: 0 25px;
+                font-size: 15px;
+                font-weight: 600;
+                color: #2C3E50;
             }
-            QPushButton:hover { background-color: #F5F7FA; border-color: #C0C4CC; }
+            QPushButton:hover { background-color: #F8F9FA; border-color: #B0B5C0; }
         """)
-        self.btn_import.clicked.connect(self.import_image)
-        top_bar.addWidget(self.btn_import)
-        top_bar.addStretch()
-        main_layout.addLayout(top_bar)
+        self.btn_import.clicked.connect(self.import_images)
 
-        # Content Splitter
-        content_splitter = QSplitter(Qt.Horizontal)
-        content_splitter.setStyleSheet("QSplitter::handle { background-color: #EBF0F5; width: 4px; }")
+        top_layout.addStretch()
+        top_layout.addWidget(self.btn_import)
+        top_layout.addStretch()
 
-        # Left Panel
-        left_panel = QWidget()
+        main_layout.addWidget(top_bar)
+
+        # 2. Main Content
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(15, 0, 15, 15)
+        content_layout.setSpacing(15)
+
+        # Left Gallery Sidebar
+        left_panel = QFrame()
+        left_panel.setFixedWidth(140)
         left_layout = QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
+
         self.thumb_list = QListWidget()
         self.thumb_list.setStyleSheet("""
-            QListWidget {
+            QListWidget { background: transparent; border: none; }
+            QListWidget::item {
                 background-color: #FFFFFF;
-                border: 1px solid #E4E7ED;
-                border-radius: 4px;
+                border: 2px solid transparent;
+                border-radius: 6px;
+                margin-bottom: 12px;
+                padding: 5px;
             }
-            QListWidget::item { padding: 10px; border-bottom: 1px solid #F0F2F5; }
-            QListWidget::item:selected { background-color: #F0F9F8; color: #00A896; font-weight: bold; }
+            QListWidget::item:selected {
+                border-color: #00A896;
+                background-color: #E6F7F5;
+            }
         """)
-        left_layout.addWidget(self.thumb_list)
-        content_splitter.addWidget(left_panel)
-        content_splitter.setStretchFactor(0, 1)
+        self.thumb_list.setIconSize(QSize(100, 130))
+        self.thumb_list.currentRowChanged.connect(self.select_page)
 
-        # Center Panel
-        center_panel = QWidget()
+        left_layout.addWidget(self.thumb_list)
+        content_layout.addWidget(left_panel)
+
+        # Center Display Area
+        center_panel = QFrame()
+        center_panel.setStyleSheet("background-color: #E6E8EC; border-radius: 8px;")
         center_layout = QVBoxLayout(center_panel)
-        center_layout.setContentsMargins(10, 0, 10, 0)
-        self.image_display = QLabel()
+        center_layout.setContentsMargins(20, 20, 20, 20)
+
+        self.image_display = QLabel("اضغط Import Images لتحميل المستندات")
         self.image_display.setAlignment(Qt.AlignCenter)
-        self.image_display.setMinimumSize(400, 400)
-        self.image_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_display.setStyleSheet("""
             QLabel {
                 background-color: #FFFFFF;
-                border: 1px solid #E4E7ED;
+                border: 1px solid #DCDFE6;
                 border-radius: 4px;
-                margin: 5px;
+                color: #909399;
+                font-size: 15px;
             }
         """)
-        center_layout.addWidget(self.image_display)
-        content_splitter.addWidget(center_panel)
-        content_splitter.setStretchFactor(1, 5)
-
-        # Right Panel
-        right_panel = QWidget()
-        right_layout = QVBoxLayout(right_panel)
-        right_layout.setContentsMargins(5, 0, 0, 0)
-
-        tools_layout = QHBoxLayout()
-        tools_layout.setSpacing(10)
-        self.btn_rotate_l = QPushButton("⟲")
-        self.btn_rotate_r = QPushButton("2")
-        self.btn_crop = QPushButton("✂ Crop")
         
-        tool_btn_style = """
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(15)
+        shadow.setColor(QColor(0, 0, 0, 30))
+        shadow.setOffset(0, 4)
+        self.image_display.setGraphicsEffect(shadow)
+
+        center_layout.addWidget(self.image_display)
+        content_layout.addWidget(center_panel, stretch=1)
+
+        # Right Control Panel
+        right_panel = QFrame()
+        right_panel.setFixedWidth(260)
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(5, 0, 5, 0)
+        right_layout.setSpacing(12)
+
+        # Action Buttons
+        tools_grid = QHBoxLayout()
+        self.btn_rot_l = QPushButton("⟲")
+        self.btn_rot_r = QPushButton("⟳")
+        self.btn_flip_h = QPushButton("⇎")
+        self.btn_flip_v = QPushButton("⇕")
+
+        for btn in [self.btn_rot_l, self.btn_rot_r, self.btn_flip_h, self.btn_flip_v]:
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #FFFFFF;
+                    border: 1px solid #DCDFE6;
+                    border-radius: 6px;
+                    font-size: 16px;
+                    height: 38px;
+                    color: #409EFF;
+                }
+                QPushButton:hover { background-color: #F2F6FC; }
+            """)
+            btn.setCursor(Qt.PointingHandCursor)
+            tools_grid.addWidget(btn)
+
+        self.btn_rot_l.clicked.connect(lambda: self.rotate_current(-90))
+        self.btn_rot_r.clicked.connect(lambda: self.rotate_current(90))
+
+        right_layout.addLayout(tools_grid)
+
+        # Crop Button
+        self.btn_crop = QPushButton(" ✂   Crop")
+        self.btn_crop.setFixedHeight(40)
+        self.btn_crop.setCursor(Qt.PointingHandCursor)
+        self.btn_crop.setStyleSheet("""
             QPushButton {
                 background-color: #FFFFFF;
                 border: 1px solid #DCDFE6;
-                padding: 10px;
-                font-size: 16px;
-                min-width: 40px;
+                border-radius: 6px;
+                font-size: 14px;
+                font-weight: bold;
+                color: #303133;
             }
             QPushButton:hover { background-color: #F5F7FA; }
-        """
-        self.btn_crop.setStyleSheet(tool_btn_style + "font-size: 13px;")
-        for btn in [self.btn_rotate_l, self.btn_rotate_r]:
-            btn.setStyleSheet(tool_btn_style)
-        
-        self.btn_rotate_l.clicked.connect(lambda: self.apply_rotation(-90))
-        self.btn_rotate_r.clicked.connect(lambda: self.apply_rotation(90))
-        self.btn_crop.clicked.connect(self.handle_manual_crop)
-
-        tools_layout.addWidget(self.btn_rotate_l)
-        tools_layout.addWidget(self.btn_rotate_r)
-        tools_layout.addWidget(self.btn_crop)
-        right_layout.addLayout(tools_layout)
-
-        right_layout.addSpacing(15)
-        
-        filters_btn_style = """
-            QPushButton {
-                background-color: #FFFFFF;
-                border: 1px solid #DCDFE6;
-                padding: 15px;
-                text-align: left;
-            }
-            QPushButton:hover { background-color: #F5F7FA; border-color: #C0C4CC; }
-        """
-
-        self.btn_original = QPushButton("Original")
-        self.btn_enhance = QPushButton("Enhance")
-        self.btn_magic = QPushButton(" Magic Pro")
-        self.btn_lighten = QPushButton("Lighten")
-        self.btn_bw = QPushButton("BW")
-
-        for btn in [self.btn_original, self.btn_enhance, self.btn_magic, self.btn_lighten, self.btn_bw]:
-            btn.setStyleSheet(filters_btn_style)
-
-        self.btn_magic.setStyleSheet("""
-            QPushButton {
-                background-color: #EBF8F7;
-                color: #00A896;
-                border: 1px solid #00A896;
-                font-weight: bold;
-                padding: 15px;
-                text-align: left;
-            }
         """)
+        self.btn_crop.clicked.connect(self.crop_current)
+        right_layout.addWidget(self.btn_crop)
 
-        right_layout.addWidget(self.btn_original)
-        right_layout.addWidget(self.btn_enhance)
-        right_layout.addWidget(self.btn_magic)
-        right_layout.addWidget(self.btn_lighten)
-        right_layout.addWidget(self.btn_bw)
+        # Filter Grid
+        filter_grid = QGridLayout()
+        filter_grid.setSpacing(10)
 
-        self.btn_original.clicked.connect(lambda: self.apply_filter("original"))
-        self.btn_enhance.clicked.connect(lambda: self.apply_filter("enhance"))
-        self.btn_magic.clicked.connect(lambda: self.apply_filter("magic"))
-        self.btn_lighten.clicked.connect(lambda: self.apply_filter("lighten"))
-        self.btn_bw.clicked.connect(lambda: self.apply_filter("bw"))
+        self.filter_btns = {}
+        filters_data = [
+            ("original", "Original", "📄"),
+            ("enhance", "Enhance", "🏔️"),
+            ("magic", "Magic Pro", "✨ AI"),
+            ("lighten", "Lighten", "☀️"),
+            ("bw", "B&W", "◐")
+        ]
 
+        row, col = 0, 0
+        for key, name, icon_str in filters_data:
+            btn = QPushButton(f"{icon_str}\n{name}")
+            btn.setFixedHeight(75)
+            btn.setCursor(Qt.PointingHandCursor)
+            
+            if key == "magic":
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #7FE5D9;
+                        color: #007A6C;
+                        border: 2px solid #00A896;
+                        border-radius: 12px;
+                        font-size: 13px;
+                        font-weight: bold;
+                    }
+                """)
+            else:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #E8ECEF;
+                        color: #4A5568;
+                        border: 1px solid #D2D6DC;
+                        border-radius: 12px;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
+                    QPushButton:hover { background-color: #E2E8F0; }
+                """)
+            
+            btn.clicked.connect(lambda checked, k=key: self.set_filter(k))
+            filter_grid.addWidget(btn, row, col)
+            self.filter_btns[key] = btn
+
+            col += 1
+            if col > 1:
+                col = 0
+                row += 1
+
+        right_layout.addLayout(filter_grid)
         right_layout.addStretch()
-        chk_apply_all = QCheckBox("Apply to All Pages")
-        chk_apply_all.setStyleSheet("color: #606266; margin-top: 20px;")
-        
-        self.btn_save = QPushButton("Save")
+
+        # Save Bar
+        self.chk_apply_all = QCheckBox("Apply to All Pages")
+        self.chk_apply_all.setChecked(True)
+        self.chk_apply_all.setStyleSheet("font-size: 13px; color: #2C3E50; font-weight: 500;")
+        right_layout.addWidget(self.chk_apply_all)
+
+        self.btn_save = QPushButton("Confirm")
+        self.btn_save.setFixedHeight(45)
+        self.btn_save.setCursor(Qt.PointingHandCursor)
         self.btn_save.setStyleSheet("""
             QPushButton {
                 background-color: #00B094;
@@ -293,97 +370,147 @@ class CamScannerPro(QMainWindow):
                 font-size: 16px;
                 font-weight: bold;
                 border-radius: 6px;
-                padding: 12px;
-                margin-top: 10px;
             }
-            QPushButton:hover { background-color: #008F78; }
+            QPushButton:hover { background-color: #00967E; }
         """)
-        self.btn_save.clicked.connect(self.save_image)
-
-        right_layout.addWidget(chk_apply_all)
+        self.btn_save.clicked.connect(self.save_images)
         right_layout.addWidget(self.btn_save)
 
-        content_splitter.addWidget(right_panel)
-        content_splitter.setStretchFactor(2, 2)
-        
-        main_layout.addWidget(content_splitter)
-
+        content_layout.addWidget(right_panel)
+        main_layout.addWidget(content_widget)
         self.setCentralWidget(central_widget)
 
-    # ==========================================
-    # 3. الوظائف والتفاعل
-    # ==========================================
+    def import_images(self):
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select Images", "", "Image Files (*.png *.jpg *.jpeg *.bmp)"
+        )
+        if not file_paths:
+            return
 
-    def import_image(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Document Image", "", "Image Files (*.png *.jpg *.jpeg *.bmp)")
-        if file_path:
-            img = cv2.imread(file_path)
-            self.original_image = ImageProcessorPro.auto_detect_and_crop(img)
-            self.filter_applied = "magic"
-            self.processed_image = ImageProcessorPro.advanced_shadow_removal(self.original_image)
+        for path in file_paths:
+            img = cv2.imread(path)
+            if img is None:
+                continue
+
+            cropped = CamScannerEngine.auto_detect_and_crop(img)
+            enhanced = CamScannerEngine.magic_pro_enhance(cropped)
+
+            data = {'orig': cropped, 'processed': enhanced, 'filter': 'magic'}
+            self.images_list.append(data)
             
-            self.thumb_list.addItem(QListWidgetItem(f"Page {self.thumb_list.count() + 1}"))
-            self.display_image(self.processed_image)
+            idx = len(self.images_list)
+            item = QListWidgetItem(f"{idx}")
+            item.setTextAlignment(Qt.AlignCenter)
+            self.thumb_list.addItem(item)
+
+        if self.images_list:
+            self.thumb_list.setCurrentRow(len(self.images_list) - 1)
+
+    def select_page(self, row):
+        if 0 <= row < len(self.images_list):
+            self.current_idx = row
+            data = self.images_list[row]
+            self.display_image(data['processed'])
+            self.update_filter_ui(data['filter'])
 
     def display_image(self, img):
         if img is None:
             return
 
         h, w, c = img.shape
-        bytes_per_line = 3 * w
         rgb_image = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        q_img = QImage(rgb_image.data, w, h, 3 * w, QImage.Format_RGB888)
 
         pixmap = QPixmap.fromImage(q_img)
-        scaled_pixmap = pixmap.scaled(self.image_display.width(), self.image_display.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        view_size = self.image_display.size()
+        scaled_pixmap = pixmap.scaled(
+            view_size.width() - 20, view_size.height() - 20, 
+            Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
         self.image_display.setPixmap(scaled_pixmap)
 
-    def apply_rotation(self, angle):
-        if self.original_image is not None:
-            self.original_image = ImageProcessorPro.rotate_image(self.original_image, angle)
-            self.apply_filter(self.filter_applied)
-
-    def handle_manual_crop(self):
-        if self.original_image is not None:
-             self.original_image = ImageProcessorPro.auto_detect_and_crop(self.original_image)
-             self.apply_filter(self.filter_applied)
-
-    def apply_filter(self, filter_type):
-        if self.original_image is None:
+    def set_filter(self, filter_key):
+        if self.current_idx < 0:
             return
 
-        self.filter_applied = filter_type
-        
-        if filter_type == "original":
-            self.processed_image = self.original_image.copy()
-        elif filter_type == "enhance":
-            self.processed_image = ImageProcessorPro.apply_enhance(self.original_image)
-        elif filter_type == "magic":
-            self.processed_image = ImageProcessorPro.advanced_shadow_removal(self.original_image)
-        elif filter_type == "lighten":
-            self.processed_image = ImageProcessorPro.apply_lighten(self.original_image)
-        elif filter_type == "bw":
-            self.processed_image = ImageProcessorPro.apply_bw(self.original_image)
+        target_indices = range(len(self.images_list)) if self.chk_apply_all.isChecked() else [self.current_idx]
 
-        self.display_image(self.processed_image)
+        for idx in target_indices:
+            data = self.images_list[idx]
+            data['filter'] = filter_key
+            orig = data['orig']
 
-    def save_image(self):
-        if self.processed_image is None:
+            if filter_key == "original":
+                data['processed'] = orig.copy()
+            elif filter_key == "enhance":
+                data['processed'] = CamScannerEngine.apply_enhance(orig)
+            elif filter_key == "magic":
+                data['processed'] = CamScannerEngine.magic_pro_enhance(orig)
+            elif filter_key == "lighten":
+                data['processed'] = CamScannerEngine.apply_lighten(orig)
+            elif filter_key == "bw":
+                data['processed'] = CamScannerEngine.apply_bw(orig)
+
+        self.display_image(self.images_list[self.current_idx]['processed'])
+        self.update_filter_ui(filter_key)
+
+    def update_filter_ui(self, active_key):
+        for key, btn in self.filter_btns.items():
+            if key == active_key:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #7FE5D9;
+                        color: #007A6C;
+                        border: 2px solid #00A896;
+                        border-radius: 12px;
+                        font-size: 13px;
+                        font-weight: bold;
+                    }
+                """)
+            else:
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #E8ECEF;
+                        color: #4A5568;
+                        border: 1px solid #D2D6DC;
+                        border-radius: 12px;
+                        font-size: 13px;
+                        font-weight: 600;
+                    }
+                    QPushButton:hover { background-color: #E2E8F0; }
+                """)
+
+    def rotate_current(self, angle):
+        if self.current_idx < 0:
+            return
+        data = self.images_list[self.current_idx]
+        data['orig'] = CamScannerEngine.rotate_image(data['orig'], angle)
+        self.set_filter(data['filter'])
+
+    def crop_current(self):
+        if self.current_idx < 0:
+            return
+        data = self.images_list[self.current_idx]
+        data['orig'] = CamScannerEngine.auto_detect_and_crop(data['orig'])
+        self.set_filter(data['filter'])
+
+    def save_images(self):
+        if not self.images_list:
             return
 
-        options = QFileDialog.Options()
-        default_dir = os.path.join(os.path.expanduser('~'), 'Documents')
-        file_path, _ = QFileDialog.getSaveFileName(self, "Save Enhanced Document", default_dir, "JPEG Image (*.jpg);;PNG Image (*.png);;All Files (*)", options=options)
-        
-        if file_path:
-            if not (file_path.lower().endswith('.jpg') or file_path.lower().endswith('.png')):
-                file_path += ".jpg"
-                
-            cv2.imwrite(file_path, self.processed_image)
-
+        if len(self.images_list) == 1:
+            path, _ = QFileDialog.getSaveFileName(self, "Save Document", "", "JPEG Image (*.jpg);;PNG Image (*.png)")
+            if path:
+                cv2.imwrite(path, self.images_list[0]['processed'])
+        else:
+            dir_path = QFileDialog.getExistingDirectory(self, "Select Save Folder")
+            if dir_path:
+                for idx, data in enumerate(self.images_list):
+                    out_path = os.path.join(dir_path, f"Page_{idx+1}.jpg")
+                    cv2.imwrite(out_path, data['processed'])
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = CamScannerPro()
+    window = CamScannerUI()
     window.show()
     sys.exit(app.exec_())
