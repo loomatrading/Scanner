@@ -1,4 +1,4 @@
-name: Build Executable
+name: Build ScanPro
 
 on: [push]
 
@@ -7,7 +7,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v4
 
     - name: Set up Python
       uses: actions/setup-python@v5
@@ -19,12 +20,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install PySide6 reportlab "opencv-python>=4.8" "Pillow>=10.0" "numpy>=1.24" "pyinstaller>=6.0"
 
-    - name: Build EXE with PyInstaller
+    - name: Build EXE
       run: |
-        pyinstaller --noconfirm --onedir --windowed --collect-all PySide6 --collect-all reportlab --collect-all cv2 --collect-all PIL app.py
+        pyinstaller --noconfirm --onefile --windowed --name ScanPro --collect-all PySide6 --collect-all reportlab --collect-all cv2 --collect-all PIL app.py
 
-    - name: Upload Artifact
+    - name: Upload EXE
       uses: actions/upload-artifact@v4
       with:
-        name: CamScanner-App
-        path: dist/app/
+        name: ScanPro-Windows
+        path: dist/ScanPro.exe
