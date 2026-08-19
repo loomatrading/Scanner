@@ -7,10 +7,8 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    # تحديث v3 إلى v4
     - uses: actions/checkout@v4
 
-    # تحديث v4 إلى v5
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
@@ -19,11 +17,11 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install PyQt5 opencv-python numpy pyinstaller
+        pip install PyQt5 opencv-python numpy Pillow pyinstaller
 
     - name: Build EXE with PyInstaller
       run: |
-        pyinstaller --noconfirm --onedir --windowed --collect-all PyQt5 --collect-all cv2 app.py
+        pyinstaller --noconfirm --onedir --windowed --collect-all PyQt5 --collect-all cv2 --collect-all PIL app.py
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
