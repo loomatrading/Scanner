@@ -7,7 +7,7 @@ import numpy as np
 
 
 class DocumentScanner:
-    def _init_(self, root):
+    def __init__(self, root):
         self.root = root
         self.root.title("Document Scanner")
         self.root.geometry("1200x800")
