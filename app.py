@@ -628,7 +628,7 @@ class ScanPro(QMainWindow):
             b.clicked.connect(lambda checked=False, n=name: self.set_mode(n))
             self.tool_buttons[name] = b
             grid.addWidget(b)
-            if len(grid) == 2:
+            if grid.count() == 2:
                 tv.addLayout(grid)
                 grid = QHBoxLayout()
 
