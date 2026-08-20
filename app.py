@@ -3,23 +3,25 @@ import os
 import cv2
 import numpy as np
 
-from PySide6.QtCore import Qt, QPointF, Signal
+from PySide6.QtCore import Qt, QPointF, Signal, QTimer
 from PySide6.QtGui import (
     QImage, QPixmap, QPainter, QPen, QBrush,
     QColor, QFont
 )
 from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QFileDialog, QVBoxLayout, QHBoxLayout, QSlider,
-    QMessageBox, QFrame, QComboBox
+    QApplication, QMainWindow, QWidget, QLabel,
+    QPushButton, QFileDialog, QVBoxLayout, QHBoxLayout,
+    QSlider, QMessageBox, QComboBox, QFrame,
+    QSizePolicy
 )
 
 from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 
 
 # ============================================================
-# Image utilities
+# POINT ORDERING
 # ============================================================
 
 def order_points(points):
@@ -33,22 +35,25 @@ def order_points(points):
     tr = pts[np.argmin(d)]
     bl = pts[np.argmax(d)]
 
-    return np.array([tl, tr, br, bl], dtype=np.float32)
+    return np.array(
+        [tl, tr, br, bl],
+        dtype=np.float32
+    )
 
+
+# ============================================================
+# DOCUMENT DETECTION
+# ============================================================
 
 def detect_document_corners(image):
-    """
-    Detect the largest document-like contour.
-    Returns 4 corners or None.
-    """
-
-    original = image.copy()
 
     h, w = image.shape[:2]
 
-    scale = 1000.0 / max(h, w)
+    # Work on smaller copy for detection only
+    max_side = 1400.0
+    scale = min(1.0, max_side / max(h, w))
 
-    if scale < 1:
+    if scale < 1.0:
         small = cv2.resize(
             image,
             None,
@@ -59,64 +64,176 @@ def detect_document_corners(image):
     else:
         small = image.copy()
 
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    gray = cv2.cvtColor(
+        small,
+        cv2.COLOR_BGR2GRAY
+    )
 
-    # Improve local contrast
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    gray = cv2.GaussianBlur(
+        gray,
+        (5, 5),
+        0
+    )
 
-    edges = cv2.Canny(gray, 50, 150)
+    candidates = []
 
-    kernel = np.ones((5, 5), np.uint8)
-    edges = cv2.morphologyEx(
-        edges,
+    # --------------------------------------------------------
+    # Method 1: white-page threshold
+    # --------------------------------------------------------
+
+    _, thresh = cv2.threshold(
+        gray,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT,
+        (9, 9)
+    )
+
+    thresh = cv2.morphologyEx(
+        thresh,
         cv2.MORPH_CLOSE,
-        kernel
+        kernel,
+        iterations=2
     )
 
     contours, _ = cv2.findContours(
+        thresh,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    candidates.extend(contours)
+
+    # --------------------------------------------------------
+    # Method 2: edge detection
+    # --------------------------------------------------------
+
+    edges = cv2.Canny(
+        gray,
+        30,
+        120
+    )
+
+    edges = cv2.dilate(
+        edges,
+        np.ones((3, 3), np.uint8),
+        iterations=1
+    )
+
+    edges = cv2.morphologyEx(
+        edges,
+        cv2.MORPH_CLOSE,
+        np.ones((7, 7), np.uint8),
+        iterations=2
+    )
+
+    contours2, _ = cv2.findContours(
         edges,
         cv2.RETR_EXTERNAL,
         cv2.CHAIN_APPROX_SIMPLE
     )
 
-    contours = sorted(
-        contours,
-        key=cv2.contourArea,
-        reverse=True
-    )
+    candidates.extend(contours2)
 
     image_area = small.shape[0] * small.shape[1]
 
-    for contour in contours[:30]:
+    best = None
+    best_score = -1
+
+    for contour in candidates:
 
         area = cv2.contourArea(contour)
 
-        if area < image_area * 0.15:
+        if area < image_area * 0.12:
             continue
 
-        perimeter = cv2.arcLength(contour, True)
-
-        approx = cv2.approxPolyDP(
+        perimeter = cv2.arcLength(
             contour,
-            0.02 * perimeter,
             True
         )
 
-        if len(approx) == 4:
+        if perimeter <= 0:
+            continue
 
-            pts = approx.reshape(4, 2).astype(np.float32)
+        approx = cv2.approxPolyDP(
+            contour,
+            0.025 * perimeter,
+            True
+        )
 
-            # Return coordinates to original image
-            if scale < 1:
-                pts /= scale
+        if len(approx) != 4:
+            continue
 
-            return order_points(pts)
+        pts = approx.reshape(
+            4,
+            2
+        ).astype(np.float32)
 
-    # Fallback: image boundaries
-    h, w = original.shape[:2]
+        # Convexity
+        if not cv2.isContourConvex(
+            pts.astype(np.int32)
+        ):
+            continue
 
-    margin_x = w * 0.03
-    margin_y = h * 0.03
+        rect_area = cv2.contourArea(pts)
+
+        if rect_area <= 0:
+            continue
+
+        rectangularity = area / rect_area
+
+        if rectangularity < 0.75:
+            continue
+
+        # Prefer large objects
+        area_score = area / image_area
+
+        # Prefer corners not too close to the image border
+        border_penalty = 0
+
+        margin = min(
+            small.shape[0],
+            small.shape[1]
+        ) * 0.015
+
+        for x, y in pts:
+
+            if (
+                x < margin or
+                y < margin or
+                x > small.shape[1] - margin or
+                y > small.shape[0] - margin
+            ):
+                border_penalty += 0.03
+
+        score = (
+            area_score * 2.0
+            + rectangularity
+            - border_penalty
+        )
+
+        if score > best_score:
+
+            best_score = score
+            best = pts
+
+    if best is not None:
+
+        if scale < 1.0:
+            best /= scale
+
+        return order_points(best)
+
+    # --------------------------------------------------------
+    # Fallback
+    # --------------------------------------------------------
+
+    margin_x = w * 0.04
+    margin_y = h * 0.04
 
     return np.array([
         [margin_x, margin_y],
@@ -126,24 +243,55 @@ def detect_document_corners(image):
     ], dtype=np.float32)
 
 
+# ============================================================
+# PERSPECTIVE CORRECTION
+# ============================================================
+
 def perspective_transform(image, corners):
 
     pts = order_points(corners)
 
     tl, tr, br, bl = pts
 
-    width_a = np.linalg.norm(br - bl)
-    width_b = np.linalg.norm(tr - tl)
+    width_top = np.linalg.norm(
+        tr - tl
+    )
 
-    max_width = int(max(width_a, width_b))
+    width_bottom = np.linalg.norm(
+        br - bl
+    )
 
-    height_a = np.linalg.norm(tr - br)
-    height_b = np.linalg.norm(tl - bl)
+    height_left = np.linalg.norm(
+        bl - tl
+    )
 
-    max_height = int(max(height_a, height_b))
+    height_right = np.linalg.norm(
+        br - tr
+    )
 
-    max_width = max(300, max_width)
-    max_height = max(300, max_height)
+    max_width = int(
+        max(
+            width_top,
+            width_bottom
+        )
+    )
+
+    max_height = int(
+        max(
+            height_left,
+            height_right
+        )
+    )
+
+    max_width = max(
+        300,
+        max_width
+    )
+
+    max_height = max(
+        300,
+        max_height
+    )
 
     destination = np.array([
         [0, 0],
@@ -160,7 +308,10 @@ def perspective_transform(image, corners):
     result = cv2.warpPerspective(
         image,
         matrix,
-        (max_width, max_height),
+        (
+            max_width,
+            max_height
+        ),
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE
     )
@@ -169,35 +320,16 @@ def perspective_transform(image, corners):
 
 
 # ============================================================
-# CamScanner-style enhancement
+# IMAGE ENHANCEMENT
 # ============================================================
 
-def enhance_document(image, mode="Document",
-                      brightness=0,
-                      contrast=100,
-                      sharpness=50):
+def correct_illumination(gray):
 
-    result = image.copy()
-
-    if mode == "Original":
-        return result
-
-    # ----------------------------------------
-    # Resize only for processing if extremely
-    # huge, but keep final dimensions
-    # ----------------------------------------
-
-    # ----------------------------------------
-    # Remove uneven illumination
-    # ----------------------------------------
-
-    gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-
+    # Estimate background illumination
     background = cv2.GaussianBlur(
         gray,
         (0, 0),
-        sigmaX=25,
-        sigmaY=25
+        25
     )
 
     background = np.maximum(
@@ -219,90 +351,203 @@ def enhance_document(image, mode="Document",
         cv2.NORM_MINMAX
     )
 
-    if mode == "B&W":
+    return normalized
 
-        # Adaptive threshold gives better
-        # document results than simple threshold
 
-        bw = cv2.adaptiveThreshold(
-            normalized,
-            255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            31,
-            12
-        )
+def document_enhancement(image):
 
-        # Remove tiny noise
-        kernel = np.ones((2, 2), np.uint8)
+    # ----------------------------------------
+    # LAB contrast improvement
+    # ----------------------------------------
 
-        bw = cv2.morphologyEx(
-            bw,
-            cv2.MORPH_OPEN,
-            kernel
-        )
+    lab = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2LAB
+    )
 
-        result = cv2.cvtColor(
-            bw,
-            cv2.COLOR_GRAY2BGR
-        )
+    l, a, b = cv2.split(lab)
 
-    elif mode == "Document":
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
 
-        # Strong but natural document processing
+    l = clahe.apply(l)
 
-        lab = cv2.cvtColor(
-            result,
-            cv2.COLOR_BGR2LAB
-        )
+    lab = cv2.merge([
+        l,
+        a,
+        b
+    ])
 
-        l, a, b = cv2.split(lab)
+    result = cv2.cvtColor(
+        lab,
+        cv2.COLOR_LAB2BGR
+    )
 
-        clahe = cv2.createCLAHE(
-            clipLimit=2.0,
-            tileGridSize=(8, 8)
-        )
+    # ----------------------------------------
+    # Light denoise
+    # ----------------------------------------
 
-        l = clahe.apply(l)
+    result = cv2.fastNlMeansDenoisingColored(
+        result,
+        None,
+        2,
+        2,
+        7,
+        21
+    )
 
-        lab = cv2.merge([l, a, b])
+    # ----------------------------------------
+    # Correct uneven lighting
+    # ----------------------------------------
 
-        result = cv2.cvtColor(
-            lab,
-            cv2.COLOR_LAB2BGR
-        )
+    gray = cv2.cvtColor(
+        result,
+        cv2.COLOR_BGR2GRAY
+    )
 
-        # Slight denoise
-        result = cv2.fastNlMeansDenoisingColored(
-            result,
-            None,
-            3,
-            3,
-            7,
-            21
+    corrected = correct_illumination(
+        gray
+    )
+
+    # Blend corrected luminance with color
+    hsv = cv2.cvtColor(
+        result,
+        cv2.COLOR_BGR2HSV
+    )
+
+    hsv[:, :, 2] = corrected
+
+    result = cv2.cvtColor(
+        hsv,
+        cv2.COLOR_HSV2BGR
+    )
+
+    # ----------------------------------------
+    # Mild sharpening
+    # ----------------------------------------
+
+    blurred = cv2.GaussianBlur(
+        result,
+        (0, 0),
+        1.2
+    )
+
+    result = cv2.addWeighted(
+        result,
+        1.20,
+        blurred,
+        -0.20,
+        0
+    )
+
+    return result
+
+
+def bw_enhancement(image):
+
+    gray = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2GRAY
+    )
+
+    # Correct shadows / illumination
+    gray = correct_illumination(
+        gray
+    )
+
+    # Increase text contrast
+    clahe = cv2.createCLAHE(
+        clipLimit=2.5,
+        tileGridSize=(8, 8)
+    )
+
+    gray = clahe.apply(
+        gray
+    )
+
+    # Adaptive threshold
+    result = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        11
+    )
+
+    # Remove tiny noise
+    result = cv2.morphologyEx(
+        result,
+        cv2.MORPH_OPEN,
+        np.ones((2, 2), np.uint8)
+    )
+
+    return cv2.cvtColor(
+        result,
+        cv2.COLOR_GRAY2BGR
+    )
+
+
+def color_enhancement(image):
+
+    lab = cv2.cvtColor(
+        image,
+        cv2.COLOR_BGR2LAB
+    )
+
+    l, a, b = cv2.split(lab)
+
+    clahe = cv2.createCLAHE(
+        clipLimit=2.0,
+        tileGridSize=(8, 8)
+    )
+
+    l = clahe.apply(l)
+
+    lab = cv2.merge([
+        l,
+        a,
+        b
+    ])
+
+    result = cv2.cvtColor(
+        lab,
+        cv2.COLOR_LAB2BGR
+    )
+
+    return result
+
+
+def enhance_image(
+    image,
+    mode,
+    brightness,
+    contrast,
+    sharpness
+):
+
+    if mode == "Original":
+
+        result = image.copy()
+
+    elif mode == "B&W":
+
+        result = bw_enhancement(
+            image
         )
 
     elif mode == "Color":
 
-        lab = cv2.cvtColor(
-            result,
-            cv2.COLOR_BGR2LAB
+        result = color_enhancement(
+            image
         )
 
-        l, a, b = cv2.split(lab)
+    else:
 
-        clahe = cv2.createCLAHE(
-            clipLimit=2.2,
-            tileGridSize=(8, 8)
-        )
-
-        l = clahe.apply(l)
-
-        lab = cv2.merge([l, a, b])
-
-        result = cv2.cvtColor(
-            lab,
-            cv2.COLOR_LAB2BGR
+        result = document_enhancement(
+            image
         )
 
     # ----------------------------------------
@@ -321,7 +566,7 @@ def enhance_document(image, mode="Document",
     # Contrast
     # ----------------------------------------
 
-    alpha = max(0.5, contrast / 100.0)
+    alpha = contrast / 100.0
 
     result = cv2.convertScaleAbs(
         result,
@@ -330,7 +575,7 @@ def enhance_document(image, mode="Document",
     )
 
     # ----------------------------------------
-    # Sharpen
+    # Sharpness
     # ----------------------------------------
 
     if sharpness > 0:
@@ -340,14 +585,14 @@ def enhance_document(image, mode="Document",
         blurred = cv2.GaussianBlur(
             result,
             (0, 0),
-            2
+            1.3
         )
 
         result = cv2.addWeighted(
             result,
-            1.0 + amount,
+            1.0 + amount * 0.7,
             blurred,
-            -amount,
+            -amount * 0.7,
             0
         )
 
@@ -355,10 +600,10 @@ def enhance_document(image, mode="Document",
 
 
 # ============================================================
-# Image conversion
+# CONVERT OPENCV IMAGE TO QPIXMAP
 # ============================================================
 
-def cv_to_qpixmap(image):
+def cv_to_pixmap(image):
 
     rgb = cv2.cvtColor(
         image,
@@ -377,14 +622,16 @@ def cv_to_qpixmap(image):
         QImage.Format_RGB888
     ).copy()
 
-    return QPixmap.fromImage(qimage)
+    return QPixmap.fromImage(
+        qimage
+    )
 
 
 # ============================================================
-# Interactive document viewer
+# ORIGINAL IMAGE VIEWER
 # ============================================================
 
-class DocumentViewer(QWidget):
+class OriginalViewer(QWidget):
 
     cornersChanged = Signal()
 
@@ -392,127 +639,193 @@ class DocumentViewer(QWidget):
 
         super().__init__()
 
-        self.setMinimumSize(700, 500)
-
         self.image = None
-        self.display_image = None
+        self.pixmap = None
 
         self.corners = []
 
         self.dragging = -1
 
-        self.margin = 30
+        self.setMinimumSize(
+            500,
+            500
+        )
 
     def set_image(self, image):
 
-        self.image = image.copy()
+        self.image = image
 
-        self.update_display()
+        self.pixmap = cv_to_pixmap(
+            image
+        )
+
+        self.update()
 
     def set_corners(self, corners):
 
         self.corners = [
-            QPointF(float(x), float(y))
-            for x, y in corners
+            QPointF(
+                float(p[0]),
+                float(p[1])
+            )
+            for p in corners
         ]
 
         self.update()
 
-    def update_display(self):
-
-        if self.image is None:
-            return
-
-        self.display_image = cv_to_qpixmap(
-            self.image
-        )
-
-        self.update()
-
-    def image_to_widget(self, point):
+    def image_to_widget(
+        self,
+        point
+    ):
 
         if self.image is None:
             return QPointF()
 
-        iw = self.image.shape[1]
-        ih = self.image.shape[0]
+        h, w = self.image.shape[:2]
 
-        available_w = self.width() - 2 * self.margin
-        available_h = self.height() - 2 * self.margin
+        area_w = self.width() - 30
+        area_h = self.height() - 30
 
         scale = min(
-            available_w / iw,
-            available_h / ih
+            area_w / w,
+            area_h / h
         )
 
-        x = self.margin + point.x() * scale
-        y = self.margin + point.y() * scale
+        display_w = w * scale
+        display_h = h * scale
 
-        return QPointF(x, y)
+        offset_x = (
+            self.width() - display_w
+        ) / 2
 
-    def widget_to_image(self, point):
+        offset_y = (
+            self.height() - display_h
+        ) / 2
+
+        return QPointF(
+            offset_x + point.x() * scale,
+            offset_y + point.y() * scale
+        )
+
+    def widget_to_image(
+        self,
+        point
+    ):
 
         if self.image is None:
             return QPointF()
 
-        iw = self.image.shape[1]
-        ih = self.image.shape[0]
+        h, w = self.image.shape[:2]
 
-        available_w = self.width() - 2 * self.margin
-        available_h = self.height() - 2 * self.margin
+        area_w = self.width() - 30
+        area_h = self.height() - 30
 
         scale = min(
-            available_w / iw,
-            available_h / ih
+            area_w / w,
+            area_h / h
         )
 
-        x = (point.x() - self.margin) / scale
-        y = (point.y() - self.margin) / scale
+        display_w = w * scale
+        display_h = h * scale
 
-        x = max(0, min(iw - 1, x))
-        y = max(0, min(ih - 1, y))
+        offset_x = (
+            self.width() - display_w
+        ) / 2
 
-        return QPointF(x, y)
+        offset_y = (
+            self.height() - display_h
+        ) / 2
+
+        x = (
+            point.x() - offset_x
+        ) / scale
+
+        y = (
+            point.y() - offset_y
+        ) / scale
+
+        x = max(
+            0,
+            min(w - 1, x)
+        )
+
+        y = max(
+            0,
+            min(h - 1, y)
+        )
+
+        return QPointF(
+            x,
+            y
+        )
 
     def paintEvent(self, event):
 
-        painter = QPainter(self)
+        painter = QPainter(
+            self
+        )
+
+        painter.setRenderHint(
+            QPainter.SmoothPixmapTransform
+        )
 
         painter.fillRect(
             self.rect(),
-            QColor("#111827")
+            QColor("#0B1020")
         )
 
-        if self.display_image is None:
-            painter.setPen(QColor("#9CA3AF"))
-            painter.setFont(QFont("Arial", 18))
+        if self.pixmap is None:
+
+            painter.setPen(
+                QColor("#9CA3AF")
+            )
+
+            painter.setFont(
+                QFont(
+                    "Arial",
+                    17
+                )
+            )
+
             painter.drawText(
                 self.rect(),
                 Qt.AlignCenter,
-                "Import File لبدء المسح"
+                "Import File"
             )
+
             return
 
-        iw = self.display_image.width()
-        ih = self.display_image.height()
+        h, w = self.image.shape[:2]
 
-        available_w = self.width() - 2 * self.margin
-        available_h = self.height() - 2 * self.margin
+        area_w = self.width() - 30
+        area_h = self.height() - 30
 
         scale = min(
-            available_w / iw,
-            available_h / ih
+            area_w / w,
+            area_h / h
         )
 
-        new_w = int(iw * scale)
-        new_h = int(ih * scale)
+        display_w = int(
+            w * scale
+        )
 
-        x = (self.width() - new_w) // 2
-        y = (self.height() - new_h) // 2
+        display_h = int(
+            h * scale
+        )
 
-        target = self.display_image.scaled(
-            new_w,
-            new_h,
+        x = (
+            self.width()
+            - display_w
+        ) // 2
+
+        y = (
+            self.height()
+            - display_h
+        ) // 2
+
+        scaled = self.pixmap.scaled(
+            display_w,
+            display_h,
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation
         )
@@ -520,11 +833,11 @@ class DocumentViewer(QWidget):
         painter.drawPixmap(
             x,
             y,
-            target
+            scaled
         )
 
         # ----------------------------------------
-        # Draw corners
+        # Crop polygon
         # ----------------------------------------
 
         if len(self.corners) == 4:
@@ -534,33 +847,63 @@ class DocumentViewer(QWidget):
                 for p in self.corners
             ]
 
-            pen = QPen(
-                QColor("#22C55E"),
-                3
+            painter.setPen(
+                QPen(
+                    QColor("#00D4A8"),
+                    3
+                )
             )
-
-            painter.setPen(pen)
 
             for i in range(4):
 
-                p1 = points[i]
-                p2 = points[(i + 1) % 4]
-
                 painter.drawLine(
-                    p1,
-                    p2
+                    points[i],
+                    points[
+                        (i + 1) % 4
+                    ]
                 )
+
+            # Semi transparent outside
+            # crop region
+
+            painter.setBrush(
+                QBrush(
+                    QColor(
+                        0,
+                        212,
+                        168,
+                        25
+                    )
+                )
+            )
+
+            painter.setPen(
+                Qt.NoPen
+            )
+
+            polygon = [
+                points[0],
+                points[1],
+                points[2],
+                points[3]
+            ]
+
+            painter.drawPolygon(
+                polygon
+            )
+
+            # Corner circles
+
+            painter.setBrush(
+                QBrush(
+                    QColor("#00D4A8")
+                )
+            )
 
             painter.setPen(
                 QPen(
                     QColor("#FFFFFF"),
                     2
-                )
-            )
-
-            painter.setBrush(
-                QBrush(
-                    QColor("#22C55E")
                 )
             )
 
@@ -572,54 +915,135 @@ class DocumentViewer(QWidget):
                     9
                 )
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(
+        self,
+        event
+    ):
 
-        if not self.corners:
+        if len(self.corners) != 4:
             return
 
         pos = event.position()
 
-        for i, corner in enumerate(self.corners):
+        for i, corner in enumerate(
+            self.corners
+        ):
 
             wp = self.image_to_widget(
                 corner
             )
 
             distance = (
-                (wp.x() - pos.x()) ** 2 +
-                (wp.y() - pos.y()) ** 2
+                (
+                    wp.x()
+                    - pos.x()
+                ) ** 2
+                +
+                (
+                    wp.y()
+                    - pos.y()
+                ) ** 2
             ) ** 0.5
 
-            if distance < 25:
+            if distance <= 28:
 
                 self.dragging = i
 
                 return
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(
+        self,
+        event
+    ):
 
         if self.dragging < 0:
             return
 
-        new_point = self.widget_to_image(
+        p = self.widget_to_image(
             event.position()
         )
 
         self.corners[
             self.dragging
-        ] = new_point
+        ] = p
 
         self.update()
 
         self.cornersChanged.emit()
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(
+        self,
+        event
+    ):
 
         self.dragging = -1
 
 
 # ============================================================
-# Main Window
+# PROCESSED VIEWER
+# ============================================================
+
+class ProcessedViewer(QLabel):
+
+    def __init__(self):
+
+        super().__init__()
+
+        self.setAlignment(
+            Qt.AlignCenter
+        )
+
+        self.setStyleSheet("""
+            QLabel {
+                background: #080D18;
+                border-radius: 10px;
+                color: #94A3B8;
+            }
+        """)
+
+        self.setText(
+            "Processed Result"
+        )
+
+        self.current_pixmap = None
+
+    def set_image(self, image):
+
+        self.current_pixmap = cv_to_pixmap(
+            image
+        )
+
+        self.update_display()
+
+    def resizeEvent(
+        self,
+        event
+    ):
+
+        super().resizeEvent(
+            event
+        )
+
+        self.update_display()
+
+    def update_display(self):
+
+        if self.current_pixmap is None:
+            return
+
+        pixmap = self.current_pixmap.scaled(
+            self.size() - self.contentsMargins(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+
+        self.setPixmap(
+            pixmap
+        )
+
+
+# ============================================================
+# MAIN APPLICATION
 # ============================================================
 
 class ScannerApp(QMainWindow):
@@ -629,18 +1053,34 @@ class ScannerApp(QMainWindow):
         super().__init__()
 
         self.setWindowTitle(
-            "ScanPro - Document Scanner"
+            "SCAN PRO - Document Scanner"
         )
 
-        self.resize(1400, 850)
+        self.resize(
+            1500,
+            900
+        )
 
         self.original_image = None
         self.scanned_image = None
         self.corners = None
 
+        # Used for delayed live processing
+        self.process_timer = QTimer()
+
+        self.process_timer.setSingleShot(
+            True
+        )
+
+        self.process_timer.timeout.connect(
+            self.process_image
+        )
+
         self.build_ui()
 
-    # --------------------------------------------------------
+    # ========================================================
+    # UI
+    # ========================================================
 
     def build_ui(self):
 
@@ -650,55 +1090,209 @@ class ScannerApp(QMainWindow):
             central
         )
 
-        main = QHBoxLayout(
+        main = QVBoxLayout(
             central
         )
 
         main.setContentsMargins(
-            0, 0, 0, 0
+            0,
+            0,
+            0,
+            0
         )
 
-        # ================================================
-        # LEFT TOOLBAR
-        # ================================================
+        main.setSpacing(
+            0
+        )
 
-        sidebar = QFrame()
+        # ====================================================
+        # TOP BAR
+        # ====================================================
 
-        sidebar.setFixedWidth(230)
+        top = QFrame()
 
-        sidebar.setStyleSheet("""
+        top.setFixedHeight(
+            70
+        )
+
+        top.setStyleSheet("""
             QFrame {
-                background: #111827;
-            }
-
-            QPushButton {
-                background: #1F2937;
-                color: white;
-                border: none;
-                border-radius: 10px;
-                padding: 13px;
-                font-size: 14px;
-                text-align: left;
-            }
-
-            QPushButton:hover {
-                background: #374151;
-            }
-
-            QComboBox {
-                background: #1F2937;
-                color: white;
-                border: none;
-                border-radius: 10px;
-                padding: 10px;
+                background: #0B1325;
             }
 
             QLabel {
-                color: #D1D5DB;
+                color: white;
             }
 
-            QSlider {
-                padding: 5px;
+            QPushButton {
+                background: #17233A;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 9px 15px;
+            }
+
+            QPushButton:hover {
+                background: #243450;
+            }
+        """)
+
+        top_layout = QHBoxLayout(
+            top
+        )
+
+        logo = QLabel(
+            "SCAN PRO"
+        )
+
+        logo.setFont(
+            QFont(
+                "Arial",
+                24,
+                QFont.Bold
+            )
+        )
+
+        top_layout.addWidget(
+            logo
+        )
+
+        subtitle = QLabel(
+            "  Document Scanner"
+        )
+
+        subtitle.setStyleSheet(
+            "color:#94A3B8;"
+        )
+
+        top_layout.addWidget(
+            subtitle
+        )
+
+        top_layout.addSpacing(
+            25
+        )
+
+        rotate_left = QPushButton(
+            "↶  Rotate Left"
+        )
+
+        rotate_left.clicked.connect(
+            lambda:
+            self.rotate_image(
+                -1
+            )
+        )
+
+        top_layout.addWidget(
+            rotate_left
+        )
+
+        rotate_right = QPushButton(
+            "↷  Rotate Right"
+        )
+
+        rotate_right.clicked.connect(
+            lambda:
+            self.rotate_image(
+                1
+            )
+        )
+
+        top_layout.addWidget(
+            rotate_right
+        )
+
+        top_layout.addStretch()
+
+        original_btn = QPushButton(
+            "Original"
+        )
+
+        original_btn.clicked.connect(
+            self.show_original
+        )
+
+        top_layout.addWidget(
+            original_btn
+        )
+
+        top_layout.addWidget(
+            QLabel("  ")
+        )
+
+        top_layout.addWidget(
+            QLabel(
+                "Auto Scan ✓"
+            )
+        )
+
+        main.addWidget(
+            top
+        )
+
+        # ====================================================
+        # MAIN CONTENT
+        # ====================================================
+
+        content = QHBoxLayout()
+
+        content.setContentsMargins(
+            10,
+            10,
+            10,
+            10
+        )
+
+        content.setSpacing(
+            10
+        )
+
+        # ====================================================
+        # LEFT SIDEBAR
+        # ====================================================
+
+        sidebar = QFrame()
+
+        sidebar.setFixedWidth(
+            220
+        )
+
+        sidebar.setStyleSheet("""
+            QFrame {
+                background: #0F172A;
+                border-radius: 12px;
+            }
+
+            QPushButton {
+                background: #182338;
+                color: #E5E7EB;
+                border: none;
+                border-radius: 9px;
+                padding: 13px;
+                text-align: left;
+                font-size: 14px;
+            }
+
+            QPushButton:hover {
+                background: #263650;
+            }
+
+            QPushButton#active {
+                background: #00A884;
+                color: white;
+            }
+
+            QLabel {
+                color: #CBD5E1;
+            }
+
+            QComboBox {
+                background: #182338;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 10px;
             }
         """)
 
@@ -706,30 +1300,19 @@ class ScannerApp(QMainWindow):
             sidebar
         )
 
-        title = QLabel(
-            "SCAN PRO"
+        side.setContentsMargins(
+            12,
+            15,
+            12,
+            15
         )
-
-        title.setFont(
-            QFont("Arial", 22, QFont.Bold)
-        )
-
-        title.setStyleSheet(
-            "color:white;"
-        )
-
-        side.addWidget(title)
-
-        subtitle = QLabel(
-            "Document Scanner"
-        )
-
-        side.addWidget(subtitle)
-
-        side.addSpacing(20)
 
         import_btn = QPushButton(
-            "📂   Import File"
+            "📄   Import File"
+        )
+
+        import_btn.setObjectName(
+            "active"
         )
 
         import_btn.clicked.connect(
@@ -741,7 +1324,7 @@ class ScannerApp(QMainWindow):
         )
 
         save_btn = QPushButton(
-            "💾   Save Image"
+            "▣   Save Image"
         )
 
         save_btn.clicked.connect(
@@ -753,7 +1336,7 @@ class ScannerApp(QMainWindow):
         )
 
         pdf_btn = QPushButton(
-            "📄   Export PDF"
+            "▤   Export PDF"
         )
 
         pdf_btn.clicked.connect(
@@ -764,14 +1347,24 @@ class ScannerApp(QMainWindow):
             pdf_btn
         )
 
-        side.addSpacing(20)
+        side.addSpacing(
+            20
+        )
 
-        mode_label = QLabel(
+        title = QLabel(
             "Enhancement"
         )
 
+        title.setFont(
+            QFont(
+                "Arial",
+                13,
+                QFont.Bold
+            )
+        )
+
         side.addWidget(
-            mode_label
+            title
         )
 
         self.mode = QComboBox()
@@ -784,14 +1377,16 @@ class ScannerApp(QMainWindow):
         ])
 
         self.mode.currentTextChanged.connect(
-            self.process_image
+            self.schedule_process
         )
 
         side.addWidget(
             self.mode
         )
 
-        side.addSpacing(15)
+        side.addSpacing(
+            12
+        )
 
         # Brightness
 
@@ -803,12 +1398,17 @@ class ScannerApp(QMainWindow):
             Qt.Horizontal
         )
 
-        self.brightness.setMinimum(-50)
-        self.brightness.setMaximum(50)
-        self.brightness.setValue(0)
+        self.brightness.setRange(
+            -30,
+            30
+        )
+
+        self.brightness.setValue(
+            8
+        )
 
         self.brightness.valueChanged.connect(
-            self.process_image
+            self.schedule_process
         )
 
         side.addWidget(
@@ -825,12 +1425,17 @@ class ScannerApp(QMainWindow):
             Qt.Horizontal
         )
 
-        self.contrast.setMinimum(50)
-        self.contrast.setMaximum(160)
-        self.contrast.setValue(100)
+        self.contrast.setRange(
+            70,
+            140
+        )
+
+        self.contrast.setValue(
+            108
+        )
 
         self.contrast.valueChanged.connect(
-            self.process_image
+            self.schedule_process
         )
 
         side.addWidget(
@@ -847,12 +1452,17 @@ class ScannerApp(QMainWindow):
             Qt.Horizontal
         )
 
-        self.sharpness.setMinimum(0)
-        self.sharpness.setMaximum(100)
-        self.sharpness.setValue(50)
+        self.sharpness.setRange(
+            0,
+            100
+        )
+
+        self.sharpness.setValue(
+            22
+        )
 
         self.sharpness.valueChanged.connect(
-            self.process_image
+            self.schedule_process
         )
 
         side.addWidget(
@@ -861,114 +1471,142 @@ class ScannerApp(QMainWindow):
 
         side.addStretch()
 
-        reset_btn = QPushButton(
-            "↺   Reset"
+        reset = QPushButton(
+            "↻   Reset"
         )
 
-        reset_btn.clicked.connect(
-            self.reset_image
+        reset.clicked.connect(
+            self.reset
         )
 
         side.addWidget(
-            reset_btn
+            reset
         )
 
-        main.addWidget(
+        content.addWidget(
             sidebar
         )
 
-        # ================================================
-        # RIGHT AREA
-        # ================================================
+        # ====================================================
+        # ORIGINAL PANEL
+        # ====================================================
 
-        right = QWidget()
+        original_panel = QFrame()
 
-        right_layout = QVBoxLayout(
-            right
-        )
-
-        right_layout.setContentsMargins(
-            0, 0, 0, 0
-        )
-
-        # Header
-
-        header = QFrame()
-
-        header.setFixedHeight(
-            65
-        )
-
-        header.setStyleSheet("""
+        original_panel.setStyleSheet("""
             QFrame {
-                background: #FFFFFF;
-                border-bottom: 1px solid #E5E7EB;
-            }
-
-            QLabel {
-                color: #111827;
-                font-size: 15px;
+                background: #0B1020;
+                border-radius: 12px;
             }
         """)
 
-        header_layout = QHBoxLayout(
-            header
+        original_layout = QVBoxLayout(
+            original_panel
         )
 
-        self.status = QLabel(
-            "Import a document to begin"
+        original_title = QLabel(
+            "Original / Crop"
         )
 
-        header_layout.addWidget(
-            self.status
+        original_title.setStyleSheet(
+            "color:white;font-weight:bold;"
         )
 
-        header_layout.addStretch()
-
-        header_layout.addWidget(
-            QLabel("Auto Scan ✓")
+        original_layout.addWidget(
+            original_title
         )
 
-        right_layout.addWidget(
-            header
+        self.original_viewer = OriginalViewer()
+
+        self.original_viewer.cornersChanged.connect(
+            self.schedule_process
         )
 
-        # Viewer
-
-        self.viewer = DocumentViewer()
-
-        self.viewer.cornersChanged.connect(
-            self.process_image
+        original_layout.addWidget(
+            self.original_viewer
         )
 
-        right_layout.addWidget(
-            self.viewer,
+        content.addWidget(
+            original_panel,
+            3
+        )
+
+        # ====================================================
+        # PROCESSED PANEL
+        # ====================================================
+
+        processed_panel = QFrame()
+
+        processed_panel.setStyleSheet("""
+            QFrame {
+                background: #0B1020;
+                border-radius: 12px;
+            }
+        """)
+
+        processed_layout = QVBoxLayout(
+            processed_panel
+        )
+
+        processed_title = QLabel(
+            "Processed Result"
+        )
+
+        processed_title.setStyleSheet(
+            "color:white;font-weight:bold;"
+        )
+
+        processed_layout.addWidget(
+            processed_title
+        )
+
+        self.processed_viewer = ProcessedViewer()
+
+        processed_layout.addWidget(
+            self.processed_viewer,
             1
         )
 
-        # Bottom
+        content.addWidget(
+            processed_panel,
+            2
+        )
+
+        main.addLayout(
+            content,
+            1
+        )
+
+        # ====================================================
+        # BOTTOM BAR
+        # ====================================================
 
         bottom = QFrame()
 
         bottom.setFixedHeight(
-            65
+            70
         )
 
         bottom.setStyleSheet("""
             QFrame {
-                background: white;
-                border-top: 1px solid #E5E7EB;
+                background: #0B1325;
             }
 
             QPushButton {
-                background: #111827;
+                background: #00A884;
                 color: white;
-                border-radius: 10px;
-                padding: 10px 20px;
+                border: none;
+                border-radius: 9px;
+                padding: 12px 30px;
+                font-weight: bold;
             }
 
             QPushButton:hover {
-                background: #374151;
+                background: #00C49A;
+            }
+
+            QLabel {
+                color: #CBD5E1;
             }
         """)
 
@@ -976,32 +1614,35 @@ class ScannerApp(QMainWindow):
             bottom
         )
 
-        bottom_layout.addStretch()
-
-        save_bottom = QPushButton(
-            "Save Scan"
+        self.info = QLabel(
+            "Import a document to begin"
         )
 
-        save_bottom.clicked.connect(
+        bottom_layout.addWidget(
+            self.info
+        )
+
+        bottom_layout.addStretch()
+
+        save_scan = QPushButton(
+            "▣   Save Scan"
+        )
+
+        save_scan.clicked.connect(
             self.save_image
         )
 
         bottom_layout.addWidget(
-            save_bottom
-        )
-
-        right_layout.addWidget(
-            bottom
+            save_scan
         )
 
         main.addWidget(
-            right,
-            1
+            bottom
         )
 
-    # ====================================================
-    # Import
-    # ====================================================
+    # ========================================================
+    # IMPORT
+    # ========================================================
 
     def import_file(self):
 
@@ -1025,7 +1666,7 @@ class ScannerApp(QMainWindow):
             QMessageBox.critical(
                 self,
                 "Error",
-                "Unable to open image."
+                "Could not open this image."
             )
 
             return
@@ -1036,84 +1677,152 @@ class ScannerApp(QMainWindow):
             image
         )
 
-        self.viewer.set_image(
+        self.original_viewer.set_image(
             image
         )
 
-        self.viewer.set_corners(
+        self.original_viewer.set_corners(
             self.corners
         )
 
-        self.status.setText(
+        self.info.setText(
             "Document detected — processing automatically"
         )
 
         self.process_image()
 
-    # ====================================================
-    # Live processing
-    # ====================================================
+    # ========================================================
+    # LIVE PROCESSING
+    # ========================================================
+
+    def schedule_process(self):
+
+        if self.original_image is None:
+            return
+
+        # Process shortly after movement
+        # instead of processing hundreds
+        # of times per second.
+
+        self.process_timer.start(
+            80
+        )
 
     def process_image(self):
 
         if self.original_image is None:
             return
 
-        corners = self.corners
+        if len(
+            self.original_viewer.corners
+        ) != 4:
 
-        if self.viewer.corners:
-
-            corners = np.array([
-                [p.x(), p.y()]
-                for p in self.viewer.corners
-            ], dtype=np.float32)
-
-        if corners is None:
             return
 
-        # Perspective correction
+        corners = np.array([
+            [
+                p.x(),
+                p.y()
+            ]
+            for p in
+            self.original_viewer.corners
+        ], dtype=np.float32)
 
-        scanned = perspective_transform(
+        # ----------------------------------------
+        # Perspective crop
+        # ----------------------------------------
+
+        cropped = perspective_transform(
             self.original_image,
             corners
         )
 
+        # ----------------------------------------
         # Enhancement
+        # ----------------------------------------
 
-        scanned = enhance_document(
-            scanned,
+        result = enhance_image(
+            cropped,
             self.mode.currentText(),
             self.brightness.value(),
             self.contrast.value(),
             self.sharpness.value()
         )
 
-        self.scanned_image = scanned
+        self.scanned_image = result
 
-        # Display the processed result immediately
-        self.viewer.set_image(
-            scanned
+        self.processed_viewer.set_image(
+            result
         )
 
-        # Keep corners corresponding to
-        # current source image only when
-        # user is dragging.
-        #
-        # After processing, viewer shows
-        # processed image, therefore remove
-        # corner overlay temporarily.
+        h, w = result.shape[:2]
 
-        self.viewer.corners = []
-
-        self.status.setText(
-            f"Processed: {scanned.shape[1]} × {scanned.shape[0]} px"
+        self.info.setText(
+            f"Scanned document: {w} × {h} px"
         )
 
-    # ====================================================
-    # Reset
-    # ====================================================
+    # ========================================================
+    # ROTATE
+    # ========================================================
 
-    def reset_image(self):
+    def rotate_image(
+        self,
+        direction
+    ):
+
+        if self.original_image is None:
+            return
+
+        if direction > 0:
+
+            self.original_image = cv2.rotate(
+                self.original_image,
+                cv2.ROTATE_90_CLOCKWISE
+            )
+
+        else:
+
+            self.original_image = cv2.rotate(
+                self.original_image,
+                cv2.ROTATE_90_COUNTERCLOCKWISE
+            )
+
+        self.corners = detect_document_corners(
+            self.original_image
+        )
+
+        self.original_viewer.set_image(
+            self.original_image
+        )
+
+        self.original_viewer.set_corners(
+            self.corners
+        )
+
+        self.process_image()
+
+    # ========================================================
+    # SHOW ORIGINAL
+    # ========================================================
+
+    def show_original(self):
+
+        if self.original_image is None:
+            return
+
+        self.original_viewer.set_image(
+            self.original_image
+        )
+
+        self.original_viewer.set_corners(
+            self.corners
+        )
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset(self):
 
         if self.original_image is None:
             return
@@ -1122,11 +1831,11 @@ class ScannerApp(QMainWindow):
             self.original_image
         )
 
-        self.viewer.set_image(
+        self.original_viewer.set_image(
             self.original_image
         )
 
-        self.viewer.set_corners(
+        self.original_viewer.set_corners(
             self.corners
         )
 
@@ -1134,15 +1843,23 @@ class ScannerApp(QMainWindow):
             "Document"
         )
 
-        self.brightness.setValue(0)
-        self.contrast.setValue(100)
-        self.sharpness.setValue(50)
+        self.brightness.setValue(
+            8
+        )
+
+        self.contrast.setValue(
+            108
+        )
+
+        self.sharpness.setValue(
+            22
+        )
 
         self.process_image()
 
-    # ====================================================
-    # Save
-    # ====================================================
+    # ========================================================
+    # SAVE IMAGE
+    # ========================================================
 
     def save_image(self):
 
@@ -1150,7 +1867,7 @@ class ScannerApp(QMainWindow):
 
             QMessageBox.warning(
                 self,
-                "No document",
+                "No Scan",
                 "Import a document first."
             )
 
@@ -1159,18 +1876,16 @@ class ScannerApp(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Save Scan",
-            "",
-            "JPEG Image (*.jpg);;PNG Image (*.png)"
+            "ScanPro.jpg",
+            "JPEG Image (*.jpg *.jpeg);;PNG Image (*.png)"
         )
 
         if not filename:
             return
 
-        ext = os.path.splitext(
-            filename
-        )[1].lower()
-
-        if ext == ".png":
+        if filename.lower().endswith(
+            ".png"
+        ):
 
             cv2.imwrite(
                 filename,
@@ -1184,7 +1899,7 @@ class ScannerApp(QMainWindow):
         else:
 
             if not filename.lower().endswith(
-                ".jpg"
+                (".jpg", ".jpeg")
             ):
                 filename += ".jpg"
 
@@ -1200,12 +1915,12 @@ class ScannerApp(QMainWindow):
         QMessageBox.information(
             self,
             "Saved",
-            "Document saved successfully."
+            "Scan saved successfully."
         )
 
-    # ====================================================
+    # ========================================================
     # PDF
-    # ====================================================
+    # ========================================================
 
     def export_pdf(self):
 
@@ -1213,7 +1928,7 @@ class ScannerApp(QMainWindow):
 
             QMessageBox.warning(
                 self,
-                "No document",
+                "No Scan",
                 "Import a document first."
             )
 
@@ -1222,7 +1937,7 @@ class ScannerApp(QMainWindow):
         filename, _ = QFileDialog.getSaveFileName(
             self,
             "Export PDF",
-            "",
+            "ScanPro.pdf",
             "PDF (*.pdf)"
         )
 
@@ -1234,14 +1949,16 @@ class ScannerApp(QMainWindow):
         ):
             filename += ".pdf"
 
+        h, w = self.scanned_image.shape[:2]
+
         # Temporary high-quality JPEG
-        temp = os.path.join(
+        temp_file = os.path.join(
             os.path.dirname(filename),
-            "_scan_temp.jpg"
+            "_scanpro_temp.jpg"
         )
 
         cv2.imwrite(
-            temp,
+            temp_file,
             self.scanned_image,
             [
                 cv2.IMWRITE_JPEG_QUALITY,
@@ -1249,26 +1966,46 @@ class ScannerApp(QMainWindow):
             ]
         )
 
-        h, w = self.scanned_image.shape[:2]
+        # A4 size in points
+        page_w, page_h = A4
+
+        ratio = min(
+            page_w / w,
+            page_h / h
+        )
+
+        draw_w = w * ratio
+        draw_h = h * ratio
+
+        x = (
+            page_w - draw_w
+        ) / 2
+
+        y = (
+            page_h - draw_h
+        ) / 2
 
         pdf = canvas.Canvas(
             filename,
-            pagesize=(w, h)
+            pagesize=A4
         )
 
         pdf.drawImage(
-            ImageReader(temp),
-            0,
-            0,
-            width=w,
-            height=h
+            ImageReader(temp_file),
+            x,
+            y,
+            width=draw_w,
+            height=draw_h,
+            preserveAspectRatio=True
         )
 
         pdf.showPage()
         pdf.save()
 
         try:
-            os.remove(temp)
+            os.remove(
+                temp_file
+            )
         except:
             pass
 
@@ -1280,12 +2017,14 @@ class ScannerApp(QMainWindow):
 
 
 # ============================================================
-# Run
+# APPLICATION
 # ============================================================
 
 if __name__ == "__main__":
 
-    app = QApplication(sys.argv)
+    app = QApplication(
+        sys.argv
+    )
 
     app.setStyle(
         "Fusion"
